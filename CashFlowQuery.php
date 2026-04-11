@@ -1,8 +1,7 @@
 <?php
 // =============================================================
-// DARINE SYSTEM — Query: Fluxo de Caixa (Cash Flow)
-// Baseado em wave_data agrupado por período
-// Estrutura: Sales → Purchases → Payroll → Financing → Net Change
+// DARINE SYSTEM — Query: Fluxo de Caixa (v2 — usa calendar)
+// Comparativo Budget x Realizado agrupado por week_label
 // =============================================================
 
 namespace Darine\Query;
@@ -19,270 +18,189 @@ class CashFlowQuery
     }
 
     // ----------------------------------------------------------------
-    // Fluxo de caixa semanal (modelo da aba "calculos")
-    // Retorna: Operating, Investing, Financing, Net Change por semana
+    // PRINCIPAL: Budget x Realizado por semana
     // ----------------------------------------------------------------
-    public function getWeeklyFlow(string $dateFrom, string $dateTo): array
-    {
-        $sql = "
+    public function getWeeklyBudgetVsRealized(
+        int $year,
+        int $monthFrom = 1,
+        int $monthTo   = 12
+    ): array {
+
+        $sqlRealized = "
             SELECT
-                r.period_date                          AS week_date,
-                m.cash_flow_category                   AS category,
-                r.account,
-                SUM(r.amount * m.sign)                 AS amount
-            FROM dre_realized r
-            JOIN account_map m
-                ON m.account_name = r.account
-                AND m.cash_flow_category IS NOT NULL
-            WHERE r.period_date BETWEEN :from AND :to
-            GROUP BY r.period_date, m.cash_flow_category, r.account
-            ORDER BY r.period_date, m.cash_flow_category, r.account
-        ";
-
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':from' => $dateFrom, ':to' => $dateTo]);
-        $rows = $stmt->fetchAll();
-
-        return $this->buildWeeklyStructure($rows);
-    }
-
-    // ----------------------------------------------------------------
-    // Fluxo de caixa mensal (agrupado por mês — para gráfico de linhas)
-    // ----------------------------------------------------------------
-    public function getMonthlyFlow(string $dateFrom, string $dateTo): array
-    {
-        $sql = "
-            SELECT
-                DATE_FORMAT(r.period_date, '%Y-%m')    AS month,
-                m.cash_flow_category                   AS category,
-                SUM(r.amount * m.sign)                 AS amount
-            FROM dre_realized r
-            JOIN account_map m
-                ON m.account_name = r.account
-                AND m.cash_flow_category IS NOT NULL
-            WHERE r.period_date BETWEEN :from AND :to
-            GROUP BY month, m.cash_flow_category
-            ORDER BY month, m.cash_flow_category
-        ";
-
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':from' => $dateFrom, ':to' => $dateTo]);
-        $rows = $stmt->fetchAll();
-
-        return $this->buildMonthlyStructure($rows);
-    }
-
-    // ----------------------------------------------------------------
-    // Resumo de caixa: Gross Inflow / Gross Outflow / Net Change
-    // Para os KPI cards do topo da tela
-    // ----------------------------------------------------------------
-    public function getSummary(string $dateFrom, string $dateTo): array
-    {
-        $sql = "
-            SELECT
-                CASE
-                    WHEN r.amount * m.sign > 0 THEN 'inflow'
-                    ELSE 'outflow'
-                END AS flow_type,
-                SUM(ABS(r.amount * m.sign)) AS total
+                cr.week_label,
+                cr.nome_mes,
+                cr.month_num,
+                cr.week_num,
+                SUM(CASE WHEN m.dre_group = 'income'
+                    THEN r.amount * m.sign ELSE 0 END)          AS income_realized,
+                SUM(CASE WHEN m.dre_group != 'income'
+                    THEN ABS(r.amount * m.sign) ELSE 0 END)     AS expenses_realized
             FROM dre_realized r
             JOIN account_map m ON m.account_name = r.account
-            WHERE r.period_date BETWEEN :from AND :to
-              AND m.cash_flow_category IN ('sales', 'purchases', 'payroll')
-            GROUP BY flow_type
+            JOIN calendar cr   ON cr.cal_date = r.period_date
+            WHERE cr.year = :year
+              AND cr.month_num BETWEEN :m_from AND :m_to
+            GROUP BY cr.week_label, cr.nome_mes, cr.month_num, cr.week_num
         ";
 
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':from' => $dateFrom, ':to' => $dateTo]);
-        $rows = $stmt->fetchAll(PDO::FETCH_KEY_PAIR);
-
-        $inflow  = (float)($rows['inflow']  ?? 0);
-        $outflow = (float)($rows['outflow'] ?? 0);
-
-        return [
-            'gross_inflow'  => $inflow,
-            'gross_outflow' => $outflow,
-            'net_change'    => $inflow - $outflow,
-        ];
-    }
-
-    // ----------------------------------------------------------------
-    // Budget vs Realizado por semana (para a tela C.F. Budget_Real)
-    // ----------------------------------------------------------------
-    public function getBudgetVsRealized(string $dateFrom, string $dateTo): array
-    {
-        $sql = "
+        $sqlBudget = "
             SELECT
-                r.period_date                      AS period,
-                m.cash_flow_category               AS category,
-                SUM(r.amount * m.sign)             AS realized,
-                COALESCE(SUM(b.amount * m.sign), 0) AS budget
-            FROM dre_realized r
-            JOIN account_map m ON m.account_name = r.account
-            LEFT JOIN dre_budget b
-                ON b.account = r.account
-                AND b.period_date = r.period_date
-            WHERE r.period_date BETWEEN :from AND :to
-              AND m.cash_flow_category IS NOT NULL
-            GROUP BY r.period_date, m.cash_flow_category
-            ORDER BY r.period_date, m.cash_flow_category
+                cb.week_label,
+                SUM(CASE WHEN m.dre_group = 'income'
+                    THEN b.amount ELSE 0 END)                   AS income_budget,
+                SUM(CASE WHEN m.dre_group != 'income'
+                    THEN ABS(b.amount) ELSE 0 END)              AS expenses_budget
+            FROM dre_budget b
+            JOIN account_map m ON m.account_name = b.account
+            JOIN calendar cb   ON cb.cal_date = b.period_date
+            WHERE cb.year = :year
+              AND cb.month_num BETWEEN :m_from AND :m_to
+            GROUP BY cb.week_label
         ";
 
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':from' => $dateFrom, ':to' => $dateTo]);
-        $rows = $stmt->fetchAll();
+        $stmtR = $this->pdo->prepare($sqlRealized);
+        $stmtR->execute([':year' => $year, ':m_from' => $monthFrom, ':m_to' => $monthTo]);
+        $realized = $stmtR->fetchAll(PDO::FETCH_ASSOC);
 
-        // Pivota: período → {sales_realized, sales_budget, purchases_realized, ...}
+        $stmtB = $this->pdo->prepare($sqlBudget);
+        $stmtB->execute([':year' => $year, ':m_from' => $monthFrom, ':m_to' => $monthTo]);
+        $budget = array_column($stmtB->fetchAll(PDO::FETCH_ASSOC), null, 'week_label');
+
         $result = [];
-        foreach ($rows as $row) {
-            $p = $row['period'];
-            if (!isset($result[$p])) {
-                $result[$p] = ['period' => $p];
-            }
-            $cat = $row['category'];
-            $result[$p][$cat . '_realized'] = (float)$row['realized'];
-            $result[$p][$cat . '_budget']   = (float)$row['budget'];
-        }
+        foreach ($realized as $row) {
+            $wk = $row['week_label'];
+            $b  = $budget[$wk] ?? ['income_budget' => 0, 'expenses_budget' => 0];
 
-        // Calcula net por período
-        foreach ($result as &$p) {
-            $p['net_realized'] = ($p['sales_realized'] ?? 0)
-                               - ($p['purchases_realized'] ?? 0)
-                               - ($p['payroll_realized'] ?? 0);
+            $incR = (float)$row['income_realized'];
+            $expR = (float)$row['expenses_realized'];
+            $netR = $incR - $expR;
 
-            $p['net_budget']   = ($p['sales_budget'] ?? 0)
-                               - ($p['purchases_budget'] ?? 0)
-                               - ($p['payroll_budget'] ?? 0);
+            $incB = (float)$b['income_budget'];
+            $expB = (float)$b['expenses_budget'];
+            $netB = $incB - $expB;
 
-            $p['net_variance'] = $p['net_realized'] - $p['net_budget'];
-
-            $p['net_variance_pct'] = $p['net_budget'] != 0
-                ? round(($p['net_variance'] / abs($p['net_budget'])) * 100, 2)
-                : null;
-        }
-        unset($p);
-
-        return array_values($result);
-    }
-
-    // ----------------------------------------------------------------
-    // Detalhes de uma semana específica (drill-down)
-    // ----------------------------------------------------------------
-    public function getWeekDetail(string $weekDate): array
-    {
-        $sql = "
-            SELECT
-                r.account,
-                m.cash_flow_category AS category,
-                m.dre_group,
-                SUM(r.amount * m.sign) AS amount
-            FROM dre_realized r
-            JOIN account_map m ON m.account_name = r.account
-            WHERE r.period_date = :week_date
-            GROUP BY r.account, m.cash_flow_category, m.dre_group
-            ORDER BY m.cash_flow_category, amount DESC
-        ";
-
-        $stmt = $this->pdo->prepare($sql);
-        $stmt->execute([':week_date' => $weekDate]);
-        $rows = $stmt->fetchAll();
-
-        // Agrupa por categoria
-        $result = [];
-        foreach ($rows as $row) {
-            $cat = $row['category'] ?? 'other';
-            if (!isset($result[$cat])) {
-                $result[$cat] = ['total' => 0.0, 'lines' => []];
-            }
-            $result[$cat]['total'] += (float)$row['amount'];
-            $result[$cat]['lines'][] = [
-                'account' => $row['account'],
-                'amount'  => (float)$row['amount'],
+            $result[] = [
+                'week_label'         => $wk,
+                'week_short'         => 'W' . $row['week_num'],
+                'nome_mes'           => $row['nome_mes'],
+                'month_num'          => (int)$row['month_num'],
+                'week_num'           => (int)$row['week_num'],
+                'income_budget'      => round($incB, 2),
+                'income_realized'    => round($incR, 2),
+                'income_var'         => round($incR - $incB, 2),
+                'income_var_pct'     => $this->varPct($incR, $incB),
+                'expenses_budget'    => round($expB, 2),
+                'expenses_realized'  => round($expR, 2),
+                'expenses_var'       => round($expR - $expB, 2),
+                'expenses_var_pct'   => $this->varPct($expR, $expB),
+                'net_budget'         => round($netB, 2),
+                'net_realized'       => round($netR, 2),
+                'net_var'            => round($netR - $netB, 2),
+                'net_var_pct'        => $this->varPct($netR, $netB),
             ];
         }
 
+        usort($result, fn($a, $b) => strcmp($a['week_label'], $b['week_label']));
         return $result;
     }
 
     // ----------------------------------------------------------------
-    // Privados
+    // Totais do período (linha de rodapé)
     // ----------------------------------------------------------------
-    private function buildWeeklyStructure(array $rows): array
+    public function getPeriodTotals(array $weeks): array
     {
-        $weeks = [];
+        $t = [
+            'week_label'         => 'TOTAL',
+            'week_short'         => 'Total',
+            'nome_mes'           => '',
+            'income_budget'      => 0, 'income_realized'   => 0,
+            'expenses_budget'    => 0, 'expenses_realized' => 0,
+            'net_budget'         => 0, 'net_realized'      => 0,
+        ];
 
+        foreach ($weeks as $w) {
+            $t['income_budget']      += $w['income_budget'];
+            $t['income_realized']    += $w['income_realized'];
+            $t['expenses_budget']    += $w['expenses_budget'];
+            $t['expenses_realized']  += $w['expenses_realized'];
+            $t['net_budget']         += $w['net_budget'];
+            $t['net_realized']       += $w['net_realized'];
+        }
+
+        $t['income_var']       = round($t['income_realized']   - $t['income_budget'],   2);
+        $t['income_var_pct']   = $this->varPct($t['income_realized'],   $t['income_budget']);
+        $t['expenses_var']     = round($t['expenses_realized'] - $t['expenses_budget'], 2);
+        $t['expenses_var_pct'] = $this->varPct($t['expenses_realized'], $t['expenses_budget']);
+        $t['net_var']          = round($t['net_realized']       - $t['net_budget'],      2);
+        $t['net_var_pct']      = $this->varPct($t['net_realized'], $t['net_budget']);
+
+        return $t;
+    }
+
+    // ----------------------------------------------------------------
+    // KPI cards do topo
+    // ----------------------------------------------------------------
+    public function getSummaryKPIs(int $year, int $monthFrom = 1, int $monthTo = 12): array
+    {
+        $weeks  = $this->getWeeklyBudgetVsRealized($year, $monthFrom, $monthTo);
+        $totals = $this->getPeriodTotals($weeks);
+
+        return [
+            'gross_inflow_realized'  => $totals['income_realized'],
+            'gross_inflow_budget'    => $totals['income_budget'],
+            'gross_inflow_var_pct'   => $totals['income_var_pct'],
+            'gross_outflow_realized' => $totals['expenses_realized'],
+            'gross_outflow_budget'   => $totals['expenses_budget'],
+            'gross_outflow_var_pct'  => $totals['expenses_var_pct'],
+            'net_realized'           => $totals['net_realized'],
+            'net_budget'             => $totals['net_budget'],
+            'net_var_pct'            => $totals['net_var_pct'],
+            'weeks_count'            => count($weeks),
+        ];
+    }
+
+    // ----------------------------------------------------------------
+    // Detalhe por conta de uma semana (drill-down)
+    // ----------------------------------------------------------------
+    public function getWeekDetail(string $weekLabel): array
+    {
+        $sql = "
+            SELECT
+                r.account,
+                m.dre_group,
+                SUM(r.amount * m.sign) AS realized
+            FROM dre_realized r
+            JOIN account_map m ON m.account_name = r.account
+            JOIN calendar cr   ON cr.cal_date = r.period_date
+            WHERE cr.week_label = :week
+            GROUP BY r.account, m.dre_group
+            ORDER BY m.dre_group, realized DESC
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([':week' => $weekLabel]);
+        $rows = $stmt->fetchAll();
+
+        $grouped = [];
         foreach ($rows as $row) {
-            $w   = $row['week_date'];
-            $cat = $row['category'];
-            $amt = (float)$row['amount'];
-
-            if (!isset($weeks[$w])) {
-                $weeks[$w] = [
-                    'week_date'  => $w,
-                    'sales'      => 0.0,
-                    'purchases'  => 0.0,
-                    'payroll'    => 0.0,
-                    'financing'  => 0.0,
-                    'details'    => [],
-                ];
+            $g = $row['dre_group'];
+            if (!isset($grouped[$g])) {
+                $grouped[$g] = ['total' => 0, 'lines' => []];
             }
-
-            if (isset($weeks[$w][$cat])) {
-                $weeks[$w][$cat] += $amt;
-            }
-
-            $weeks[$w]['details'][] = [
-                'category' => $cat,
+            $grouped[$g]['total']   += (float)$row['realized'];
+            $grouped[$g]['lines'][] = [
                 'account'  => $row['account'],
-                'amount'   => $amt,
+                'realized' => round((float)$row['realized'], 2),
             ];
         }
 
-        // Calcula net operating e net total por semana
-        foreach ($weeks as &$w) {
-            $w['net_operating'] = $w['sales'] - $w['purchases'] - $w['payroll'];
-            $w['net_total']     = $w['net_operating'] + $w['financing'];
-        }
-        unset($w);
-
-        return array_values($weeks);
+        return $grouped;
     }
 
-    private function buildMonthlyStructure(array $rows): array
+    private function varPct(float $realized, float $budget): ?float
     {
-        $months = [];
-
-        foreach ($rows as $row) {
-            $m   = $row['month'];
-            $cat = $row['category'];
-            $amt = (float)$row['amount'];
-
-            if (!isset($months[$m])) {
-                $months[$m] = [
-                    'month'     => $m,
-                    'sales'     => 0.0,
-                    'purchases' => 0.0,
-                    'payroll'   => 0.0,
-                    'financing' => 0.0,
-                ];
-            }
-
-            if (isset($months[$m][$cat])) {
-                $months[$m][$cat] += $amt;
-            }
-        }
-
-        foreach ($months as &$m) {
-            $m['net_operating'] = $m['sales'] - $m['purchases'] - $m['payroll'];
-            $m['net_total']     = $m['net_operating'] + $m['financing'];
-
-            // Margem operacional %
-            $m['operating_margin_pct'] = $m['sales'] > 0
-                ? round(($m['net_operating'] / $m['sales']) * 100, 2)
-                : 0.0;
-        }
-        unset($m);
-
-        return array_values($months);
+        if ($budget == 0) return null;
+        return round((($realized - $budget) / abs($budget)) * 100, 1);
     }
 }
